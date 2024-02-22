@@ -5,14 +5,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
-	"mime"
-	"mime/multipart"
 	"net/smtp"
 	"strings"
 
-	"github.com/emersion/go-imap"
-	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-imap/v2"
+	client "github.com/emersion/go-imap/v2/imapclient"
 )
 
 type Config struct {
@@ -20,6 +17,7 @@ type Config struct {
 	SmtpServer string
 	ImapPort   int
 	ImapServer string
+	OAuth2     bool
 }
 
 type Email struct {
@@ -42,6 +40,24 @@ func GmailConfig() Config {
 		SmtpServer: "smtp.gmail.com",
 		ImapPort:   993,
 		ImapServer: "imap.gmail.com",
+	}
+}
+
+func OutlookConfig() Config {
+	return Config{
+		SmtpPort:   587,
+		SmtpServer: "smtp.office365.com",
+		ImapPort:   993,
+		ImapServer: "outlook.office365.com",
+	}
+}
+
+func QMailConfig() Config {
+	return Config{
+		SmtpPort:   587,
+		SmtpServer: "smtp.qq.com",
+		ImapPort:   993,
+		ImapServer: "imap.qq.com",
 	}
 }
 
@@ -69,6 +85,7 @@ func (e *Email) Login(user, passwd string) error {
 
 		// 启用 TLS 加密
 		if err = send.StartTLS(&tls.Config{
+			ServerName:         e.SmtpServer,
 			InsecureSkipVerify: true,
 		}); err != nil {
 			return err
@@ -84,16 +101,15 @@ func (e *Email) Login(user, passwd string) error {
 	// 接收端
 	{
 		// 创建一个 IMAP 客户端
-		recv, err := client.DialTLS(e.imapAdder(), &tls.Config{
-			InsecureSkipVerify: true,
-		})
+		recv, err := client.DialTLS(e.imapAdder(), nil)
 		if err != nil {
 			e.Release()
 			return err
 		}
 
 		// 登录您的账号和密码
-		if err = recv.Login(user, passwd); err != nil {
+		cmd := recv.Login(user, passwd)
+		if err = cmd.Wait(); err != nil {
 			e.Release()
 			return err
 		}
@@ -118,139 +134,141 @@ func (e *Email) RecvMessage(box string, readOnly bool, criteria *imap.SearchCrit
 		return nil, errors.New("do it after login")
 	}
 
-	mbox, err := e.recv.Select(box, readOnly)
+	cmd := e.recv.Select(box, &imap.SelectOptions{
+		ReadOnly: readOnly,
+	})
 
-	// 搜索您想要获取的邮件，例如最新的一封
-	ids, err := e.recv.Search(criteria)
+	selectRows, err := cmd.Wait()
 	if err != nil {
 		return nil, err
 	}
-	if len(ids) == 0 {
+
+	numMessages := int(selectRows.NumMessages)
+	if numMessages == 0 {
 		return nil, errors.New("no mail")
 	}
 
-	maxLen := 10
-	if l := len(ids); l < maxLen {
-		maxLen = l
+	// 搜索您想要获取的邮件
+	searchRows, err := e.recv.Search(criteria, nil).Wait()
+	if err != nil {
+		return nil, err
 	}
 
-	// 获取邮件的内容
-	section := &imap.BodySectionName{Peek: true}
-	items := []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope, imap.FetchBodyStructure}
-	messages := make(chan *imap.Message, maxLen)
-	done := make(chan error, 1)
-	go func() {
-		s := new(imap.SeqSet)
-		s.AddNum(ids...)
-		s.AddRange(mbox.Messages-uint32(maxLen), mbox.Messages)
-		done <- e.recv.Fetch(s, items, messages)
-	}()
+	ids := searchRows.AllSeqNums()
+	numMessages = len(ids)
+	if numMessages == 0 {
+		return nil, errors.New("no mail")
+	}
 
-	Address := func(iter []*imap.Address) []string {
-		var r []string
-		for _, o := range iter {
-			r = append(r, o.Address())
-		}
-		return r
+	// 只读10条
+	var maxLen = 10
+	if numMessages < maxLen {
+		maxLen = numMessages
+	}
+
+	limit := imap.SeqSetNum(ids[numMessages-maxLen:]...)
+	var messages []*client.FetchMessageBuffer
+
+	// 获取邮件的内容
+	fetchOptions := &imap.FetchOptions{
+		Flags:         true,
+		Envelope:      true,
+		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
+		BodySection: []*imap.FetchItemBodySection{
+			{
+				Specifier: imap.PartSpecifierHeader,
+			},
+			{
+				Part: []int{1, 2, 3},
+			},
+		},
+	}
+
+	// 获取数据
+	fetchCmd := e.recv.Fetch(limit, fetchOptions)
+	if messages, err = fetchCmd.Collect(); err != nil {
+		return nil, err
 	}
 
 	var subjects []Subject
-	// 读取邮件的内容
-	for {
-		msg := <-messages
-		if msg == nil {
-			break
-		}
-		body := msg.GetBody(section)
-		if body == nil {
-			fmt.Println("Server didn't return message body")
-			break
-		}
-
-		// readBody := Read(body)
-
-		// 获取邮件的内容类型
-		var (
-			content     []string
-			htmlContent []string
-		)
-		if msg.BodyStructure != nil {
-			// 获取邮件的内容类型
-			contentType := mime.FormatMediaType(msg.BodyStructure.MIMEType, msg.BodyStructure.Params)
-			mediaType, params, _ := mime.ParseMediaType(contentType)
-			if mediaType == "multipart" {
-				reader := multipart.NewReader(body, params["boundary"])
-				for {
-					part, er := reader.NextPart()
-					if er == io.EOF {
-						break
-					}
-					partEncoding := part.Header.Get("Content-Transfer-Encoding")
-					mime := part.Header.Get("Content-Type")
-					var result string
-					if partEncoding == "base64" {
-						// 创建一个 base64 解码器
-						decoder := base64.NewDecoder(base64.StdEncoding, part)
-						data, _ := io.ReadAll(decoder)
-						result = string(data)
-					} else {
-						data, _ := io.ReadAll(part)
-						result = string(data)
-					}
-
-					if strings.Contains(mime, "text/html") {
-						htmlContent = append(htmlContent, result)
-					} else {
-						content = append(content, result)
-					}
-				}
-			} else {
-				mime := msg.BodyStructure.MIMESubType
-				var result string
-				if msg.BodyStructure.Encoding == "base64" {
-					decoder := base64.NewDecoder(base64.StdEncoding, body)
-					// 读取解码后的内容
-					data, _ := io.ReadAll(decoder)
-					result = string(data)
-				} else {
-					data, _ := io.ReadAll(body)
-					result = string(data)
-				}
-
-				index := strings.Index(result, "\r\n\r\n")
-				if index > 0 {
-					result = result[index:]
-				}
-
-				if mime == "html" {
-					htmlContent = append(htmlContent, result)
-				} else {
-					content = append(content, result)
-				}
+	for _, messageBuffer := range messages {
+		{
+			content, er := messageString(messageBuffer)
+			if er != nil {
+				return subjects, er
 			}
-		}
 
-		subjects = append(subjects, Subject{
-			Address(msg.Envelope.From),
-			Address(msg.Envelope.To),
-			msg.Envelope.Subject,
-			strings.Join(content, "\n\n"),
-			strings.Join(htmlContent, "\n\n"),
-		})
+			subjects = append(subjects, Subject{
+				From:    addrStrings(messageBuffer.Envelope.From),
+				To:      addrStrings(messageBuffer.Envelope.To),
+				Title:   messageBuffer.Envelope.Subject,
+				Content: content,
+			})
+		}
 
 		// 标记邮件为已读
 		store := e.recv.Store
-		seqSet := new(imap.SeqSet)
-		seqSet.AddNum(msg.SeqNum)
-		storeItems := imap.FormatFlagsOp(imap.AddFlags, true)
-		storeFlags := []interface{}{imap.SeenFlag}
-		if err = store(seqSet, storeItems, storeFlags, nil); err != nil {
-			return subjects, err
+		seqSet := imap.SeqSetNum(messageBuffer.SeqNum)
+		storeItems := imap.StoreFlags{
+			Op: imap.StoreFlagsAdd,
+			Flags: []imap.Flag{
+				imap.FlagSeen,
+			},
+		}
+		storeCmd := store(seqSet, &storeItems, nil)
+		if er := storeCmd.Wait(); er != nil {
+			return subjects, er
 		}
 	}
 
-	<-done
 	return subjects, nil
+}
+
+func messageString(messageBuffer *client.FetchMessageBuffer) (string, error) {
+	if messageBuffer == nil {
+		return "", nil
+	}
+
+	multiPart, ok := messageBuffer.BodyStructure.(*imap.BodyStructureMultiPart)
+	if ok {
+		index := 0
+		for _, section := range messageBuffer.BodySection {
+			if index == 1 {
+				structure, ok := multiPart.Children[0].(*imap.BodyStructureSinglePart)
+				if ok {
+					if structure.Encoding == "BASE64" {
+						decodeBytes, err := base64.StdEncoding.DecodeString(string(section))
+						if err != nil {
+							return "", err
+						}
+						return string(decodeBytes), nil
+					}
+					return string(section), nil
+				}
+			}
+			index++
+		}
+	}
+
+	singlePart, ok := messageBuffer.BodyStructure.(*imap.BodyStructureSinglePart)
+	if ok {
+		index := 0
+		for _, section := range messageBuffer.BodySection {
+			if index == 1 {
+				if singlePart.Encoding == "BASE64" {
+					decodeBytes, err := base64.StdEncoding.DecodeString(string(section))
+					if err != nil {
+						return "", err
+					}
+					return string(decodeBytes), nil
+				}
+				return string(section), nil
+			}
+			index++
+		}
+	}
+
+	return "", nil
 }
 
 func (e *Email) SendMessage(from, to, subject, body string) error {
@@ -289,4 +307,12 @@ func (e *Email) SendMessage(from, to, subject, body string) error {
 		return err
 	}
 	return nil
+}
+
+func addrStrings(addr []imap.Address) []string {
+	var buf []string
+	for _, value := range addr {
+		buf = append(buf, value.Addr())
+	}
+	return buf
 }
