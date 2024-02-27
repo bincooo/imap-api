@@ -17,21 +17,19 @@ type Config struct {
 	SmtpServer string
 	ImapPort   int
 	ImapServer string
-	OAuth2     bool
 }
 
 type Email struct {
 	Config
-	send *smtp.Client
-	recv *client.Client
+	sc *smtp.Client
+	rc *client.Client
 }
 
 type Subject struct {
-	From        []string
-	To          []string
-	Title       string
-	Content     string
-	HtmlContent string
+	From    []string // 发送者
+	To      []string // 接收者
+	Title   string   // 标题
+	Content string   // 内容
 }
 
 func GmailConfig() Config {
@@ -95,7 +93,7 @@ func (e *Email) Login(user, passwd string) error {
 		if err = send.Auth(smtp.PlainAuth("", user, passwd, e.SmtpServer)); err != nil {
 			return err
 		}
-		e.send = send
+		e.sc = send
 	}
 
 	// 接收端
@@ -113,7 +111,7 @@ func (e *Email) Login(user, passwd string) error {
 			e.Release()
 			return err
 		}
-		e.recv = recv
+		e.rc = recv
 	}
 
 	return nil
@@ -121,20 +119,22 @@ func (e *Email) Login(user, passwd string) error {
 
 // 退出登陆
 func (e *Email) Release() {
-	if e.send != nil {
-		_ = e.send.Close()
+	if e.sc != nil {
+		_ = e.sc.Close()
+		e.sc = nil
 	}
-	if e.recv != nil {
-		_ = e.recv.Logout()
+	if e.rc != nil {
+		_ = e.rc.Logout()
+		e.rc = nil
 	}
 }
 
 func (e *Email) RecvMessage(box string, readOnly bool, criteria *imap.SearchCriteria) ([]Subject, error) {
-	if e.recv == nil {
+	if e.rc == nil {
 		return nil, errors.New("do it after login")
 	}
 
-	cmd := e.recv.Select(box, &imap.SelectOptions{
+	cmd := e.rc.Select(box, &imap.SelectOptions{
 		ReadOnly: readOnly,
 	})
 
@@ -149,7 +149,7 @@ func (e *Email) RecvMessage(box string, readOnly bool, criteria *imap.SearchCrit
 	}
 
 	// 搜索您想要获取的邮件
-	searchRows, err := e.recv.Search(criteria, nil).Wait()
+	searchRows, err := e.rc.Search(criteria, nil).Wait()
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +185,7 @@ func (e *Email) RecvMessage(box string, readOnly bool, criteria *imap.SearchCrit
 	}
 
 	// 获取数据
-	fetchCmd := e.recv.Fetch(limit, fetchOptions)
+	fetchCmd := e.rc.Fetch(limit, fetchOptions)
 	if messages, err = fetchCmd.Collect(); err != nil {
 		return nil, err
 	}
@@ -207,7 +207,7 @@ func (e *Email) RecvMessage(box string, readOnly bool, criteria *imap.SearchCrit
 		}
 
 		// 标记邮件为已读
-		store := e.recv.Store
+		store := e.rc.Store
 		seqSet := imap.SeqSetNum(messageBuffer.SeqNum)
 		storeItems := imap.StoreFlags{
 			Op: imap.StoreFlagsAdd,
@@ -272,16 +272,26 @@ func messageString(messageBuffer *client.FetchMessageBuffer) (string, error) {
 }
 
 func (e *Email) SendMessage(from, to, subject, body string) error {
-	if e.send == nil {
-		return errors.New("do it after login")
+	if e.sc == nil {
+		return errors.New("please login")
 	}
+	return e.sendMessage("text/plain", from, to, subject, body)
+}
 
+func (e *Email) SendHtmlMessage(from, to, subject, body string) error {
+	if e.sc == nil {
+		return errors.New("please login")
+	}
+	return e.sendMessage("text/html", from, to, subject, body)
+}
+
+func (e *Email) sendMessage(contentType, from, to, subject, body string) error {
 	// 发送一封邮件
 	header := make(map[string]string)
 	header["From"] = from
 	header["To"] = to
 	header["Subject"] = subject
-	header["Content-Type"] = "text/plain; charset=UTF-8"
+	header["Content-Type"] = contentType + "; charset=UTF-8"
 	var message strings.Builder
 	for k, v := range header {
 		message.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
@@ -289,21 +299,21 @@ func (e *Email) SendMessage(from, to, subject, body string) error {
 	message.WriteString("\r\n")
 	message.WriteString(body)
 
-	if err := e.send.Mail(from); err != nil {
+	if err := e.sc.Mail(from); err != nil {
 		return err
 	}
 
-	if err := e.send.Rcpt(to); err != nil {
+	if err := e.sc.Rcpt(to); err != nil {
 		return err
 	}
 
-	writer, err := e.send.Data()
+	w, err := e.sc.Data()
 	if err != nil {
 		return err
 	}
-	defer writer.Close()
+	defer w.Close()
 
-	if _, err = writer.Write([]byte(message.String())); err != nil {
+	if _, err = w.Write([]byte(message.String())); err != nil {
 		return err
 	}
 	return nil
